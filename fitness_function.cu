@@ -35,6 +35,7 @@ __device__ float sphere(deviceMem data, int particleIdx, int swarmIdx){
  */
 __device__ float getFitness(deviceMem data, int particleIdx, int swarmIdx){
 	return sphere(data, particleIdx, swarmIdx);
+	//return griewank(data, particleIdx, swarmIdx);
 }
 
 /*__device__ float getFitness(deviceMem data, int particleIdx, int swarmIdx){

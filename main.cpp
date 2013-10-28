@@ -15,7 +15,7 @@
 #include <boost/random/variate_generator.hpp>
 
 #define DEBUG false
-#define VERBOSE 1 //0 to 2, 0, very little is printed
+#define VERBOSE 0 //0 to 2, 0, very little is printed
 
 using namespace std;
 
@@ -32,7 +32,7 @@ bool startOK     = false;
  * 
  * global, not optimizable
  */
-int numDimensions = 40;
+int numDimensions = 10;
 
 /**
  * number of iterations
@@ -51,7 +51,7 @@ int publishEvery = 100;
  * 
  * this number is rounded up to a factor of warp size
  */
-int numParticles = 32;
+int numParticles = 64;
 
 /**
  * number of random numbers to hold
@@ -66,8 +66,16 @@ int numRandom = 9000000;
 int numSwarms = 32;
 
 /**
- * 
+ * when to do spillover
  */
+int spilloverEvery = 100;
+
+/**
+ * number of particles to spillover
+ *
+ *
+ */
+int spillOverNum=1;
 
 /**
  * number of devices
@@ -107,6 +115,70 @@ void extListener(){
 	//parse the input string
 	//inject the message to the correct queue
 }
+/**
+ * makes spillover in the swarms
+ */
+void doSpillover(int d){
+	return; //TODO make everything below work
+	//copy data to host
+	int swarmSize = SWARM_SIZE(numDimensions, devs[d].numParticles) * devs[d].numSwarms * sizeof(float);
+	cerr << "size: " << swarmSize << endl;
+	float* swarms = (float*) malloc(swarmSize);
+	cudaDeviceSynchronize();//we really can't do anything if device is not finished
+	cudaMemcpy(swarms, devs[d].swarms, swarmSize, cudaMemcpyDeviceToHost);
+
+	//spillover ring topology 
+	for(int sIdx = 0 ; sIdx < devs[d].numSwarms ; sIdx++){
+		//TODO support spillover for more than 1 particle
+		int   bestIdx = SB_VAL_IDX(sIdx, numDimensions, devs[d].numParticles), //best in this swarm
+			  worstIdx; //worst in (sIdx + 1) % numSwarms
+		float bestVal,
+			  worstVal;
+
+		int wsIdx = (sIdx+1)%devs[d].numSwarms;
+		bestVal = swarms[bestIdx];
+		worstVal = 0;
+
+		//find the single worst
+		for(int pIdx=0 ; pIdx < devs[d].numParticles ; pIdx++){
+			if(swarms[PB_VAL_IDX(wsIdx, pIdx, devs[d].numDimensions, devs[d].numParticles)] > worstVal){
+				worstVal = swarms[PB_VAL_IDX((sIdx+1)%devs[d].numSwarms, pIdx, devs[d].numDimensions, devs[d].numParticles)];
+				worstIdx = pIdx;
+			}
+		}
+		//swapp particle bests
+		swarms[PB_VAL_IDX(wsIdx, worstIdx, devs[d].numDimensions, devs[d].numParticles)] = bestVal;
+		swarms[bestIdx] = worstVal;
+
+		//swap positions and velocities
+		for(int d=0 ; d<devs[d].numDimensions ; d++){
+			float h; //best
+			/*
+			//swap positions
+			h = swarms[bestIdx];
+			swarms[bestIdx] = swarms[worstIdx];
+			swarms[worstIdx] = h;
+			
+			//swapp velocities
+			h = swarms[VELOCITY_IDX(sIdx, d, bestIdx, devs[d].numDimensions, devs[d].numParticles)];
+			swarms[VELOCITY_IDX(sIdx, d, bestIdx, devs[d].numDimensions, devs[d].numParticles)]
+				= swarms[VELOCITY_IDX(wsIdx, d, worstIdx, devs[d].numDimensions, devs[d].numParticles)];
+			swarms[VELOCITY_IDX(wsIdx, d, worstIdx, devs[d].numDimensions, devs[d].numParticles)] = h;
+			
+			//swapp particle best positions
+			h = swarms[PB_POS_IDX(sIdx, d, bestIdx, devs[d].numDimensions, devs[d].numParticles)];
+			swarms[PB_POS_IDX(sIdx, d, bestIdx, devs[d].numDimensions, devs[d].numParticles)]
+				= swarms[PB_POS_IDX(wsIdx, d, worstIdx, devs[d].numDimensions, devs[d].numParticles)];
+			swarms[PB_POS_IDX(wsIdx, d, worstIdx, devs[d].numDimensions, devs[d].numParticles)] = h;*/
+		}
+	}
+
+	//Copy back to device
+	cudaMemcpy(devs[d].swarms, swarms, swarmSize, cudaMemcpyHostToDevice);
+
+	//remember to clean
+	free(swarms);
+}
 
 /**
  * This function starts local swarms and listens contiously on buffered
@@ -116,39 +188,33 @@ void extListener(){
  * a swarm pr. dev?
  */
 void swarm(int dev){
-	//TODO is this thread safe? Am I assured that I work on this device even if
-	//other threads changes device?
+	//set device
 	cudaSetDevice(dev);
 	cudaDeviceProp devProp;
 	cudaGetDeviceProperties(&devProp, dev);
-	//wait till startOK is true.
-	//boost::this_thread::sleep(boost::posix_time::milliseconds(5000));
 
-		//do an iteration on the gfx card:
-		int particlesPrBlock = devProp.warpSize;
-		int swarmsPrBlock = devProp.maxThreadsPerBlock / particlesPrBlock;
-		
-		//swarmsPrBlock * devProp.warpSize = devProp.maxThreadsPerBlock
-		int xBlockNum = devs[dev].numParticles / particlesPrBlock;
-		int yBlockNum = devs[dev].numSwarms / swarmsPrBlock;
+	//calculate threads pr. block
+	int particlesPrBlock = devProp.warpSize;
+	int swarmsPrBlock = devProp.maxThreadsPerBlock / particlesPrBlock;
+	
+	//calculate number of blocks
+	int xBlockNum = devs[dev].numParticles / particlesPrBlock;
+	int yBlockNum = devs[dev].numSwarms / swarmsPrBlock;
 
 	cerr << "running swarm on dev: " << dev << " ppb: " << particlesPrBlock << " spb: " << swarmsPrBlock;
 	cerr << " xBlockNum " << xBlockNum << " yBlockNum: " << yBlockNum << endl;
 	while(iterations-- > 0){
-	//start the swarm:
-		//empty external swarm detail queue
-		
 		//iteration count incremented (done here to avoid device by 0)
 		devs[dev].iterationCur++;
 
 		//make sure the last iteration is done
-		//cudaDeviceSynchronize();
+		cudaDeviceSynchronize();
 		
 		//run an iteration
 		doIterationShim(devs[dev],
 			dim3(xBlockNum, yBlockNum), //blockNum
 			dim3(particlesPrBlock , swarmsPrBlock));//threadsPrBlcok
-		
+
 		//every x iterations, extract some key values, and write the to external sources (stdout)
 		if(VERBOSE > 1 && iterations%publishEvery == 0)
 			publishSwarms(dev);
@@ -201,6 +267,7 @@ void memInit(int d){
 	}
 
 	//copy to device
+	cerr << "size " << size << endl;
 	cudaMemcpy(devs[d].swarms, lMem, size*sizeof(float), cudaMemcpyHostToDevice);
 }
 
@@ -304,6 +371,8 @@ void printUniversallyBest(int d){
 		cout << pos[dimIdx] << ", ";
 	}
 	cout << ")" << endl;
+
+	free(swarms);
 }
 
 /**
@@ -337,6 +406,8 @@ void publishSwarms(int d){
 		}
 		cout << ")" << endl;
 	}
+
+	free(swarms);
 }
 
 /**
